@@ -1,0 +1,294 @@
+name: Vidura - sast
+
+on:
+  workflow_dispatch:
+  push:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install vidura=="0.3.32"
+
+      - name: Request ID token
+        id: tokenid
+        run: |
+          IDTOKEN=$(curl \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json; api-version=2.0" \
+            -H "Content-Type: application/json" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.vidura.dev" | jq -r '.value')
+
+
+          jwtd() {
+            if [[ -x $(command -v jq) ]]; then
+              jq -R 'split(".") | .[0], .[1] | @base64d | fromjson' <<< "$1"
+              echo "Signature: $(echo "$1" | awk -F'.' '{print $3}')"
+            fi
+          }
+
+
+          jwtd "$IDTOKEN"
+
+          echo "idToken=$IDTOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Vidura config
+        id: set_run_config
+        env:
+          OIDC_TOKEN: ${{ steps.tokenid.outputs.idToken }}
+
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            "https://vidhura-api.vishleshan.ai/api/v1/config" \
+            -d @- <<EOF > cfg.json
+          {
+            "agent": "sast",
+            "preferences": {
+              "doc_style": "detailed",
+              "base_branch": "main",
+              "output_dir": "docs"
+            },
+            "repo_context": {
+              "owner": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}",
+              "branch": "${{ github.ref_name }}",
+              "commit": "${{ github.sha }}",
+              "run_id": "${{ github.run_id }}"
+            }
+          }
+          EOF
+
+          #echo "=== Raw response ==="
+          #cat cfg.json
+
+          #echo "=== Pretty JSON ==="
+          #jq . cfg.json
+
+          # Common values
+          PROVIDER=$(jq -r '.config.provider' cfg.json)
+          MODEL=$(jq -r '.config.model' cfg.json)
+          VIDURA_SCAN_CONCURRENCY="20"
+
+          MAX_INPUT=$(jq -r '.config.max_input_tokens' cfg.json)
+          MAX_OUTPUT=$(jq -r '.config.max_output_tokens' cfg.json)
+
+          CURRENT_MONTH_REMAINING_TOKENS=$(jq -r '.quota.tokensRemainingThisMonth' cfg.json)
+          EACH_RUN_TOKEN_QUOTA_LIMIT=$(jq -r '.quota.limitPerRun' cfg.json)
+
+          VIDURA_GLOBAL_MEMORY_REPO_URL=$(jq -r '.global_memory.repo_url' cfg.json)
+          VIDURA_GLOBAL_MEMORY_BRANCH=$(jq -r '.global_memory.branch' cfg.json)
+          VIDURA_GLOBAL_MEMORY_TOKEN=$(jq -r '.global_memory.memory_token' cfg.json)
+
+          LLM_API_KEY=$(jq -r '.config.key // empty' cfg.json)
+          PROVIDER_NORMALIZED=$(printf '%s' "$PROVIDER" | tr '[:upper:]' '[:lower:]')
+
+          if [ -z "${LLM_API_KEY:-}" ]; then
+            echo "Config response is missing config.key for provider '$PROVIDER_NORMALIZED'"
+            exit 1
+          fi
+
+          echo "::add-mask::$LLM_API_KEY"
+
+          # Run metadata
+          echo "VIDURA_FIRST_RUN=$(jq -r '.is_first_run' cfg.json)" >> "$GITHUB_ENV"
+          echo "AGENT_RUN_ID=$(jq -r '.run_id' cfg.json)" >> "$GITHUB_ENV"
+          echo "VIDURA_PROVIDER=$PROVIDER" >> "$GITHUB_ENV"
+
+          # Agentic Docs
+          echo "AGENTIC_DOCS_PROVIDER=$PROVIDER" >> "$GITHUB_ENV"
+          echo "AGENTIC_DOCS_MODEL=$MODEL" >> "$GITHUB_ENV"
+          echo "VIDURA_SCAN_CONCURRENCY=$VIDURA_SCAN_CONCURRENCY" >> "$GITHUB_ENV"
+          echo "AGENTIC_DOCS_MAX_INPUT_TOKENS=$MAX_INPUT" >> "$GITHUB_ENV"
+          echo "AGENTIC_DOCS_MAX_OUTPUT_TOKENS=$MAX_OUTPUT" >> "$GITHUB_ENV"
+
+          # Vidura SAST
+          echo "VIDURA_SAST_PROVIDER=$PROVIDER" >> "$GITHUB_ENV"
+          echo "VIDURA_SAST_MODEL=$MODEL" >> "$GITHUB_ENV"
+          echo "VIDURA_SAST_MAX_INPUT_TOKENS=$MAX_INPUT" >> "$GITHUB_ENV"
+          echo "VIDURA_SAST_MAX_OUTPUT_TOKENS=$MAX_OUTPUT" >> "$GITHUB_ENV"
+
+          # Global memory
+          echo "VIDURA_GLOBAL_MEMORY_REPO=$VIDURA_GLOBAL_MEMORY_REPO_URL" >> "$GITHUB_ENV"
+          echo "VIDURA_GLOBAL_MEMORY_BRANCH=$VIDURA_GLOBAL_MEMORY_BRANCH" >> "$GITHUB_ENV"
+          echo "VIDURA_GLOBAL_MEMORY_TOKEN=$VIDURA_GLOBAL_MEMORY_TOKEN" >> "$GITHUB_ENV"
+
+          echo "MEMORY_TOKEN_URL=$(jq -r '.memory_token_url' cfg.json)" >> "$GITHUB_ENV"
+          echo "VIDURA_UPLOAD_URL=$(jq -r '.upload_url' cfg.json)" >> "$GITHUB_ENV"
+          echo "VIDURA_PROGRESS_URL=$(jq -r '.progress_url' cfg.json)" >> "$GITHUB_ENV"
+          echo "VIDURA_CALLBACK_URL=$(jq -r '.callback_url' cfg.json)" >> "$GITHUB_ENV"
+
+          # Quota
+          #echo "CURRENT_MONTH_REMAINING_TOKENS=$CURRENT_MONTH_REMAINING_TOKENS" >> "$GITHUB_ENV"
+          #echo "EACH_RUN_TOKEN_QUOTA_LIMIT=$EACH_RUN_TOKEN_QUOTA_LIMIT" >> "$GITHUB_ENV"
+
+          # Secret
+          echo "VIDURA_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+          case "$PROVIDER_NORMALIZED" in
+            anthropic)
+              echo "ANTHROPIC_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+              ;;
+            openai)
+              echo "OPENAI_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+              ;;
+            azure_openai|azure-openai|azureopenai)
+              echo "AZURE_OPENAI_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+              echo "OPENAI_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+              ;;
+            aws_bedrock|aws-bedrock|bedrock)
+              echo "AWS_BEDROCK_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+              echo "BEDROCK_API_KEY=$LLM_API_KEY" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "No provider-specific API key variable mapping for provider '$PROVIDER_NORMALIZED'; using VIDURA_API_KEY only."
+              ;;
+          esac
+
+          #echo "=== Exported Environment Variables ==="
+          #cat "$GITHUB_ENV"
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Agent Custom Prompt
+        env:
+          OIDC_TOKEN: ${{ steps.tokenid.outputs.idToken }}
+        run: |
+          set -euo pipefail
+
+          # Default to optional prompt mode so downstream steps never depend on this.
+          echo "VIDURA_CUSTOM_PROMPT_GENERATOR_URL=None" >> "$GITHUB_ENV"
+          echo "VIDURA_CUSTOM_PROMPT_FILE_PATH=None" >> "$GITHUB_ENV"
+
+          HTTP_CODE=$(curl --silent --show-error \
+            --output prompt_meta.json \
+            --write-out "%{http_code}" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Accept: application/json" \
+            "https://vidhura-api.vishleshan.ai/api/v1/prompts/agent_skills/agent_current_active_prompt?org_id=54997ca5-131b-4d4f-8c91-22075c3adc2e&repo_id=632a2514-6afd-41a2-bf93-fc3c73031d4f&agent_name=sast&skill_name=primary-agent" || true)
+
+          if [ "${HTTP_CODE:-}" != "200" ]; then
+            echo "No active custom prompt found (status: ${HTTP_CODE:-unknown}); continuing without custom prompt."
+            exit 0
+          fi
+
+          VIDURA_CUSTOM_PROMPT_GENERATOR_URL="$(jq -r '.prompt_file_presigned_url // empty' prompt_meta.json 2>/dev/null || true)"
+          if [ -z "$VIDURA_CUSTOM_PROMPT_GENERATOR_URL" ]; then
+            echo "Active prompt response did not include prompt_file_presigned_url; continuing without custom prompt."
+            exit 0
+          fi
+
+          echo "VIDURA_CUSTOM_PROMPT_GENERATOR_URL=$VIDURA_CUSTOM_PROMPT_GENERATOR_URL" >> "$GITHUB_ENV"
+
+          echo "::add-mask::$VIDURA_CUSTOM_PROMPT_GENERATOR_URL"
+
+          if curl --fail --silent --show-error \
+            "$VIDURA_CUSTOM_PROMPT_GENERATOR_URL" \
+            > "$RUNNER_TEMP/prompt.md"; then
+            echo "VIDURA_CUSTOM_PROMPT_FILE=$RUNNER_TEMP/prompt.md" >> "$GITHUB_ENV"
+          else
+            echo "Failed to fetch prompt file from presigned URL; continuing without custom prompt file."
+          fi
+
+      - name: Run Vidura
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          VIDURA_BASE_BRANCH: "main"
+          VIDURA_OUTPUT_DIR: "docs"
+          VIDURA_NO_AUTO_COMMIT: "false"
+          VIDURA_COMMIT_MESSAGE: "docs: feature/[vidura]"
+          VIDURA_MAX_INPUT_TOKENS: "500000"
+          VIDURA_COMPANY_NAME: "Havells03"
+          
+
+        run: |
+          set -euo pipefail
+          vidura init --agent sast
+          #vidura doctor --agent sast
+          vidura run --agent sast --verbose
+
+      #- name: Push all docs
+      #  if: always()
+      #  run: |
+      #    git add docs/ skills/ .agent/
+      #    git diff --staged --quiet || git commit -m "docs: auto-generated documentation"
+      #    git pull --rebase origin HEAD
+      #    git push origin HEAD
+
+
+      - name: Final Progress Update Call Back
+        if: always()
+        id: call_back
+        env:
+          RUN_CALLBACK_REQUEST: ${{ env.RUN_CALLBACK_REQUEST }}
+        run: |
+          set -euo pipefail
+
+          OIDC_TOKEN=$(curl --silent --show-error --fail \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json; api-version=2.0" \
+            -H "Content-Type: application/json" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.vidura.dev" | jq -r '.value')
+
+          if [ -z "${OIDC_TOKEN:-}" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "Failed to mint OIDC token for callback"
+            exit 1
+          fi
+
+          if [ -z "${VIDURA_CALLBACK_URL:-}" ]; then
+            echo "VIDURA_CALLBACK_URL is not set"
+            exit 1
+          fi
+
+          if [ -z "${RUN_CALLBACK_REQUEST:-}" ]; then
+            echo "RUN_CALLBACK_REQUEST is empty"
+            exit 1
+          fi
+
+          echo "$RUN_CALLBACK_REQUEST" | jq .
+          HTTP_STATUS=$(curl --silent --show-error \
+            --output callback_response.json \
+            --write-out "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            "$VIDURA_CALLBACK_URL" \
+            --data "$RUN_CALLBACK_REQUEST")
+
+          echo "Callback response status: $HTTP_STATUS"
+          cat callback_response.json
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Callback request failed"
+            exit 1
+          fi
+
