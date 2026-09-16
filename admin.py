@@ -161,3 +161,5 @@ def hard_delete_user(user_id: int):
     db.close()
     return {"message": f"User {user_id} and all associated data permanently deleted"}
     #Newchange
+#Print("heloo")
+DB_PASSWORD = "aAAA33434"
